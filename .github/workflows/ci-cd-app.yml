@@ -1,0 +1,86 @@
+name: "App CI/CD — Test, Build & Trigger Deploy"
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  PROJECT_ID: sara-sandbox-interns
+  BUCKET_NAME: vprofile-build-artifacts 
+  WIF_PROVIDER: ${{ secrets.WIF_PROVIDER }} 
+  GH_ACTIONS_SA: ${{ secrets.GH_ACTIONS_SA }} 
+
+jobs:
+  test-and-build:
+    name: "Test, Build & Upload"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # Obavezno za Workload Identity Federation (WIF)
+
+    steps:
+      # ── Korak 1: Preuzimanje koda ──────────────────────────────────────────
+      - name: Checkout App Code
+        uses: actions/checkout@v4
+
+      # ── Korak 2: Podešavanje Java okruženja ────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+
+      - name: Run Unit & Integration Tests
+        run: mvn clean test
+
+
+      - name: Build WAR Package
+        run: mvn package -DskipTests
+
+
+      - name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.GH_ACTIONS_SA }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      # ── Korak 6: Upload .war fajla na GCS ──────────────────────────────────
+      # Generišemo unikatnu putanju na osnovu kratkog Git SHA koda.
+      # Na ovaj način imamo istoriju svih build-ova i fajlovi se nikada ne prebrisuju.
+      - name: Upload WAR to GCS
+        id: upload
+        run: |
+          GIT_SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-8)
+          GCS_DESTINATION="gs://${{ env.BUCKET_NAME }}/builds/${GIT_SHA_SHORT}/vprofile-v2.war"
+          
+          echo "Sending artefact to GCS: ${GCS_DESTINATION}"
+          gcloud storage cp target/vprofile-v2.war "${GCS_DESTINATION}"
+          echo "Final Test 2"
+          echo "gcs_war_path=${GCS_DESTINATION}" >> $GITHUB_OUTPUT
+    
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: "aleksandarsrajer-devoteam"
+          repositories: "Vprofile-infra"
+
+      
+      - name: Trigger Infra Deployment Pipeline
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: aleksandarsrajer-devoteam/Vprofile-infra 
+          event-type: deploy
+          client-payload: |
+            {
+              "git_sha": "${{ github.sha }}",
+              "gcs_war_path": "${{ steps.upload.outputs.gcs_war_path }}",
+              "target_infra_branch": "Ansible/Packer"
+            }
